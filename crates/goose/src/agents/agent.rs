@@ -3734,6 +3734,7 @@ impl Agent {
                                 .await?;
 
                                 yield AgentEvent::HistoryReplaced(compaction.conversation.clone());
+                                yield AgentEvent::Usage(compaction.usage.clone());
 
                                 yield AgentEvent::Message(
                                     Message::assistant().with_system_notification(
