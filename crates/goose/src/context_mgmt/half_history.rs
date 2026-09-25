@@ -13,7 +13,7 @@ use tracing::info;
 /// Token budget for the summarized (older) half. A summarizer with a small
 /// context window cannot take a proportional slice of a very long history, so
 /// the split is a fixed budget rather than a share of the total.
-const OLDER_HALF_TOKEN_BUDGET: usize = 30_000;
+const OLDER_HALF_TOKEN_BUDGET: usize = 50_000;
 
 /// Minimum messages left verbatim, so a compaction can never reduce the
 /// conversation to a summary alone.

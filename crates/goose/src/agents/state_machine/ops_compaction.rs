@@ -25,6 +25,12 @@ use goose_providers::model::ModelConfig;
 
 const COMPACTION_THINKING_TEXT: &str = "goose is compacting the conversation...";
 
+pub(crate) fn post_turn_compaction_enabled() -> bool {
+    std::env::var("GOOSE_POST_TURN_COMPACTION")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false)
+}
+
 pub(super) const MAX_CONTEXT_ERROR_COMPACTIONS: usize = 2;
 
 fn compaction_part(
@@ -84,6 +90,7 @@ pub struct CompactionOperation {
     context_limit: usize,
     threshold: f64,
     manages_own_context: bool,
+    post_turn: bool,
 }
 
 impl CompactionOperation {
@@ -100,6 +107,7 @@ impl CompactionOperation {
             context_limit,
             threshold,
             manages_own_context,
+            post_turn: post_turn_compaction_enabled(),
         }
     }
 
@@ -282,15 +290,21 @@ impl Operation<Session, GooseEffect> for CompactionOperation {
             // awaits tool responses, hiding an unanswered request orphans its result,
             // and RecipeOperation delivers a successful final output from a tool tail.
             let tail = last_effective_role(messages)?;
-            if tail == EffectiveRole::Assistant
+            let turn_complete = tail == EffectiveRole::Assistant
                 || awaits_tool_responses(messages)
                 || (tail == EffectiveRole::Tool
-                    && RecipeOperation::successful_final_output(messages).is_some())
-            {
+                    && RecipeOperation::successful_final_output(messages).is_some());
+            let tokens = self.context_tokens(session, conversation).await?;
+            if tokens <= 0 {
                 return not_applicable();
             }
-            let tokens = self.context_tokens(session, conversation).await?;
-            if tokens <= 0 || !self.over_threshold(tokens as usize) {
+            // With post-turn compaction the pre-inference pass only runs once the
+            // threshold is already crossed, so the gate below is unchanged; the
+            // post-turn pass lives in the agent loops and fires on every completed turn.
+            if !self.over_threshold(tokens as usize) {
+                return not_applicable();
+            }
+            if turn_complete && !self.post_turn {
                 return not_applicable();
             }
         }
