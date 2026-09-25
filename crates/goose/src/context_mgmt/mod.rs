@@ -1,5 +1,7 @@
 pub use goose_context_management::structured;
 
+pub mod half_history;
+
 use crate::conversation::message::MessageMetadata;
 use crate::conversation::message::{Message, MessageContent};
 use crate::conversation::{merge_consecutive_messages, Conversation};
@@ -128,18 +130,52 @@ pub async fn compact_messages(
         (None, None, false)
     };
 
-    let messages_to_compact = messages.as_slice();
+    // Only the older half of the history is summarized; the recent half is kept
+    // verbatim so the retained context has a bounded size instead of one the
+    // summarizer chooses. The preserved prompt stays inside the summarized
+    // block: its archived copy is what the user-visible history keeps, while
+    // the agent-visible replay copy is re-appended below.
+    //
+    // Off by default: with the flag unset this is byte-for-byte the previous
+    // whole-history compaction, so the feature can be rolled out independently
+    // of the tests and callers that exercise it.
+    // get_param::<bool> deserializes strictly, so env values like "1" or "yes"
+    // would silently disable the flag; read the raw string and accept the same
+    // spellings as the GOOSE_STATE_MACHINE toggle.
+    let half_history_enabled = std::env::var("GOOSE_HALF_HISTORY_COMPACTION")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false);
+    let split_index = if half_history_enabled {
+        half_history::retained_split(messages).await
+    } else {
+        None
+    };
+    info!(
+        split_index = ?split_index,
+        total_messages = messages.len(),
+        "Compaction split decision"
+    );
+    let empty: &[Message] = &[];
+    let (older_messages, retained_messages): (&[Message], &[Message]) = match split_index {
+        Some(split) => messages.split_at(split),
+        None => (&messages[..], empty),
+    };
 
     let (summary_message, summarization_usage) =
-        do_compact(provider, model_config, session_id, messages_to_compact).await?;
+        do_compact(provider, model_config, session_id, older_messages).await?;
 
     // Create the final message list with updated visibility metadata:
-    // 1. Original messages become user_visible but not agent_visible
+    // 1. Summarized messages become user_visible but not agent_visible
     // 2. Summary message becomes agent_visible but not user_visible
     // 3. Assistant messages to continue the conversation are also agent_visible but not user_visible
     let mut final_messages = Vec::new();
+    let max_existing_created = messages
+        .iter()
+        .map(|msg| msg.created)
+        .max()
+        .unwrap_or(i64::MIN);
 
-    for msg in messages_to_compact {
+    for msg in older_messages {
         let updated_metadata = msg.metadata.clone().with_agent_invisible();
         let updated_msg = msg.clone().with_metadata(updated_metadata);
         final_messages.push(updated_msg);
@@ -160,35 +196,54 @@ pub async fn compact_messages(
     let continuation_msg = Message::assistant()
         .with_text(continuation_text)
         .with_metadata(MessageMetadata::agent_only());
-    let continuation_created = continuation_msg.created;
     continuation_messages.push(continuation_msg);
 
-    let (merged_continuation, _issues) = merge_consecutive_messages(continuation_messages);
-    final_messages.extend(merged_continuation);
+    let retained_messages: Vec<Message> = retained_messages.to_vec();
 
-    if let Some(mut user_msg) = preserved_user_message {
-        user_msg.created = continuation_created;
-        final_messages.push(user_msg);
-    }
+    let (merged_continuation, _issues) = merge_consecutive_messages(continuation_messages);
 
     // Carry the turn's own context event (it follows the preserved prompt) so
     // a mid-turn retry keeps it; anything earlier belongs to a previous turn.
+    // It is inserted before the continuation, never after it: a compacted
+    // conversation must end on the agent-visible continuation, because
+    // Conversation validation drops a trailing assistant message.
+    let mut carried_turn_context = None;
     if let Some(carry_from) = preserved_idx.map(|idx| idx + 1) {
-        if let Some(turn_context) = messages_to_compact[carry_from..]
+        if let Some(turn_context) = messages[carry_from.min(messages.len())..]
             .iter()
             .rev()
             .find(|msg| msg.is_turn_context() && msg.is_agent_visible())
         {
             let mut carried = turn_context.clone();
             carried.id = None;
-            // Storage reloads order by created_timestamp; the copy must keep
-            // its appended position, not resurface at the original event's time.
-            if let Some(latest) = final_messages.iter().map(|msg| msg.created).max() {
-                carried.created = carried.created.max(latest);
-            }
-            final_messages.push(carried);
+            carried_turn_context = Some(carried);
         }
     }
+
+    // The retained verbatim half is older than the summary, so it precedes the
+    // summary and the continuation. The continuation stays last of the new
+    // messages, preserving the invariant that a compacted conversation ends on
+    // the agent-visible "context was compacted" turn that the next provider
+    // request is built from.
+    let mut tail: Vec<Message> = Vec::new();
+    tail.extend(merged_continuation);
+    tail.extend(retained_messages);
+    if let Some(user_msg) = preserved_user_message {
+        tail.push(user_msg);
+    }
+    if let Some(carried) = carried_turn_context.take() {
+        tail.push(carried);
+    }
+
+    let start_created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let start_created = start_created.max(max_existing_created + 1);
+    for (offset, msg) in tail.iter_mut().enumerate() {
+        msg.created = start_created + offset as i64;
+    }
+    final_messages.extend(tail);
 
     let conversation = Conversation::new_unvalidated(final_messages);
     let retained_context_tokens = match count_context_tokens(conversation.messages()).await {
@@ -271,6 +326,45 @@ pub async fn check_if_compaction_needed(
         usage_ratio > threshold
     };
     Ok(needs_compaction)
+}
+
+/// Post-turn compaction fires after the model's final message of a turn, while
+/// the user reads the response, regardless of the auto-compact threshold. The
+/// only gate is a minimum history size of 1/10 of the context window, so
+/// one-message exchanges are not compacted.
+pub async fn check_if_post_turn_compaction_needed(
+    provider: &dyn Provider,
+    conversation: &Conversation,
+    session: &crate::session::Session,
+) -> Result<bool> {
+    if provider.manages_own_context() {
+        return Ok(false);
+    }
+
+    let messages = conversation.messages();
+    let model_config = session
+        .model_config
+        .clone()
+        .unwrap_or_else(|| ModelConfig::new("unknown"));
+    let context_limit =
+        crate::context_limit::get_context_limit(provider, &model_config.model_name).await?;
+
+    let current_tokens: usize = match session.usage.total_tokens {
+        Some(tokens) => tokens as usize,
+        None => {
+            let token_counter = create_token_counter()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to create token counter: {}", e))?;
+
+            messages
+                .iter()
+                .filter(|m| m.is_agent_visible())
+                .map(|msg| token_counter.count_chat_tokens("", std::slice::from_ref(msg), &[]))
+                .sum()
+        }
+    };
+
+    Ok(current_tokens > (context_limit as usize) / 10)
 }
 
 struct GooseCompactionModel<'a> {

@@ -49,7 +49,8 @@ use crate::config::extensions::name_to_key;
 use crate::config::permission::PermissionManager;
 use crate::config::{Config, GooseMode};
 use crate::context_mgmt::{
-    check_if_compaction_needed, compact_messages, DEFAULT_COMPACTION_THRESHOLD,
+    check_if_compaction_needed, check_if_post_turn_compaction_needed, compact_messages,
+    DEFAULT_COMPACTION_THRESHOLD,
 };
 use crate::conversation::message::{
     ActionRequiredData, InferenceMetadata, Message, MessageContent, MessageUsage, ProviderMetadata,
@@ -85,6 +86,12 @@ use tracing::{debug, error, info, instrument, warn};
 const DEFAULT_MAX_TURNS: u32 = 1000;
 const DEFAULT_STOP_HOOK_BLOCK_CAP: u32 = 8;
 const COMPACTION_PROGRESS_TEXT: &str = "goose is compacting the conversation...";
+
+fn post_turn_compaction_enabled() -> bool {
+    std::env::var("GOOSE_POST_TURN_COMPACTION")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false)
+}
 const MAX_EMPTY_TURN_RETRIES: u32 = 3;
 const EMPTY_TURN_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
@@ -1000,6 +1007,61 @@ impl Agent {
             .map_err(|e| anyhow!("Could not resolve model config: {e}"))
     }
 
+    /// Model used to write compaction summaries. Defaults to the session model, but
+    /// `GOOSE_COMPACT_MODEL` (with optional `GOOSE_COMPACT_PROVIDER`) points
+    /// compaction at a cheaper or local model, keeping the large history out of
+    /// the primary model's context.
+    pub(super) async fn compaction_model_config(
+        &self,
+        session_id: &str,
+    ) -> Result<goose_providers::model::ModelConfig> {
+        let config = Config::global();
+        let Ok(compact_model) = config.get_param::<String>("GOOSE_COMPACT_MODEL") else {
+            return self.model_config_for_session(session_id).await;
+        };
+        if compact_model.trim().is_empty() {
+            return self.model_config_for_session(session_id).await;
+        }
+        let provider_name = config
+            .get_param::<String>("GOOSE_COMPACT_PROVIDER")
+            .or_else(|_| config.get_goose_provider())
+            .map_err(|_| anyhow!("GOOSE_COMPACT_MODEL set but no provider configured"))?;
+        crate::model_config::model_config_from_user_config(&provider_name, compact_model.trim())
+            .map_err(|e| anyhow!("Could not resolve compaction model config: {e}"))
+    }
+
+    /// Provider used to run the compaction request, matching
+    /// `compaction_model_config` when that override is active.
+    pub(super) async fn compaction_provider(&self, session_id: &str) -> Result<Arc<dyn Provider>> {
+        let config = Config::global();
+        let Ok(compact_model) = config.get_param::<String>("GOOSE_COMPACT_MODEL") else {
+            return self.provider().await;
+        };
+        if compact_model.trim().is_empty() {
+            return self.provider().await;
+        }
+        let provider_name = config
+            .get_param::<String>("GOOSE_COMPACT_PROVIDER")
+            .or_else(|_| config.get_goose_provider())
+            .map_err(|_| anyhow!("GOOSE_COMPACT_MODEL set but no provider configured"))?;
+        let session = self
+            .config
+            .session_manager
+            .get_session(session_id, false)
+            .await
+            .context("Failed to get session")?;
+        let extensions = EnabledExtensionsState::extensions_or_default(
+            Some(&session.extension_data),
+            Config::global(),
+        );
+        crate::providers::create_with_working_dir(
+            &provider_name,
+            extensions,
+            session.working_dir.clone(),
+        )
+        .await
+    }
+
     pub(super) async fn effective_model_config_for_session(
         &self,
         session_id: &str,
@@ -1640,10 +1702,13 @@ impl Agent {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn create_state_machine(
         &self,
         provider: Arc<dyn Provider>,
         model_config: goose_providers::model::ModelConfig,
+        compaction_provider: Arc<dyn Provider>,
+        compaction_model_config: goose_providers::model::ModelConfig,
         context_limit: usize,
         max_turns: Option<u32>,
         cancel: CancellationToken,
@@ -1689,8 +1754,8 @@ impl Agent {
         ];
         if !manages_own_context {
             operations.push(Arc::new(CompactionOperation::new(
-                provider.clone(),
-                model_config.clone(),
+                compaction_provider,
+                compaction_model_config,
                 context_limit,
                 compaction_threshold,
             )));
@@ -1974,9 +2039,13 @@ impl Agent {
             crate::context_limit::get_context_limit(provider.as_ref(), &model_config.model_name)
                 .await?;
         let steer_queue = self.steer_queue(&session_id).await;
+        let compaction_provider = self.compaction_provider(&session_id).await?;
+        let compaction_model_config = self.compaction_model_config(&session_id).await?;
         let machine = self.create_state_machine(
-            provider,
-            model_config,
+            provider.clone(),
+            model_config.clone(),
+            compaction_provider.clone(),
+            compaction_model_config.clone(),
             context_limit,
             session_config.max_turns,
             cancel.clone(),
@@ -2007,6 +2076,65 @@ impl Agent {
                 drop(emit);
                 while let Some(event) = rx.recv().await {
                     yield event;
+                }
+
+                if post_turn_compaction_enabled() {
+                    let post_session = session_manager.get_session(&session_id, true).await?;
+                    if let Some(post_conversation) = post_session.conversation.clone() {
+                        if check_if_post_turn_compaction_needed(
+                            provider.as_ref(),
+                            &post_conversation,
+                            &post_session,
+                        )
+                        .await?
+                        {
+                            yield AgentEvent::Message(
+                                Message::assistant().with_system_notification(
+                                    SystemNotificationType::ProgressMessage,
+                                    COMPACTION_PROGRESS_TEXT,
+                                )
+                            );
+
+                            match compact_messages(
+                                compaction_provider.as_ref(),
+                                &compaction_model_config,
+                                &session_id,
+                                &post_conversation,
+                                false,
+                            )
+                            .await
+                            {
+                                Ok(compaction) => {
+                                    session_manager
+                                        .replace_conversation(&session_id, &compaction.conversation)
+                                        .await?;
+                                    self.update_session_metrics(
+                                        &session_id,
+                                        session_config.schedule_id.clone(),
+                                        &compaction.usage,
+                                        Some(compaction.retained_context_tokens),
+                                    )
+                                    .await?;
+
+                                    yield AgentEvent::HistoryReplaced(compaction.conversation.clone());
+
+                                    yield AgentEvent::Message(
+                                        Message::assistant().with_system_notification(
+                                            SystemNotificationType::InlineMessage,
+                                            "Compaction complete",
+                                        )
+                                    );
+                                }
+                                Err(e) => {
+                                    yield AgentEvent::Message(
+                                        Message::assistant().with_text(
+                                            format!("Ran into this error trying to compact: {e}.\n\nPlease try again or create a new session")
+                                        )
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
             .instrument(reply_span),
@@ -2323,13 +2451,15 @@ impl Agent {
             }
         }
 
-        let needs_auto_compact = check_if_compaction_needed(
-            self.provider().await?.as_ref(),
-            &conversation,
-            None,
-            &session,
-        )
-        .await?;
+        let post_turn_compaction = post_turn_compaction_enabled();
+        let needs_auto_compact = !post_turn_compaction
+            && check_if_compaction_needed(
+                self.provider().await?.as_ref(),
+                &conversation,
+                None,
+                &session,
+            )
+            .await?;
 
         let conversation_to_compact = conversation.clone();
         let reply_span = tracing::Span::current();
@@ -2368,9 +2498,10 @@ impl Agent {
                     )
                 );
 
-                let compact_model_config = self.model_config_for_session(&session_config.id).await?;
+                let compact_model_config = self.compaction_model_config(&session_config.id).await?;
+                let compact_provider = self.compaction_provider(&session_config.id).await?;
                 match compact_messages(
-                    self.provider().await?.as_ref(),
+                    compact_provider.as_ref(),
                     &compact_model_config,
                     &session_config.id,
                     &conversation_to_compact,
@@ -3151,9 +3282,13 @@ impl Agent {
                                 )
                             );
 
+                            let recovery_compact_config =
+                                self.compaction_model_config(&session_config.id).await?;
+                            let recovery_compact_provider =
+                                self.compaction_provider(&session_config.id).await?;
                             match compact_messages(
-                                self.provider().await?.as_ref(),
-                                &model_config,
+                                recovery_compact_provider.as_ref(),
+                                &recovery_compact_config,
                                 &session_config.id,
                                 &conversation,
                                 false,
@@ -3556,6 +3691,67 @@ impl Agent {
 
             if !stop_hook_handled_for_exit {
                 self.emit_stop_hook(&session_config.id, &last_assistant_text, &session.working_dir.to_string_lossy()).await;
+            }
+
+            if post_turn_compaction_enabled() {
+                let post_session = session_manager.get_session(&session_config.id, true).await?;
+                if let Some(post_conversation) = post_session.conversation.clone() {
+                    if check_if_post_turn_compaction_needed(
+                        self.provider().await?.as_ref(),
+                        &post_conversation,
+                        &post_session,
+                    )
+                    .await?
+                    {
+                        yield AgentEvent::Message(
+                            Message::assistant().with_system_notification(
+                                SystemNotificationType::ProgressMessage,
+                                COMPACTION_PROGRESS_TEXT,
+                            )
+                        );
+
+                        let compact_model_config = self.compaction_model_config(&session_config.id).await?;
+                        let compact_provider = self.compaction_provider(&session_config.id).await?;
+                        match compact_messages(
+                            compact_provider.as_ref(),
+                            &compact_model_config,
+                            &session_config.id,
+                            &post_conversation,
+                            false,
+                        )
+                        .await
+                        {
+                            Ok(compaction) => {
+                                session_manager
+                                    .replace_conversation(&session_config.id, &compaction.conversation)
+                                    .await?;
+                                self.update_session_metrics(
+                                    &session_config.id,
+                                    session_config.schedule_id.clone(),
+                                    &compaction.usage,
+                                    Some(compaction.retained_context_tokens),
+                                )
+                                .await?;
+
+                                yield AgentEvent::HistoryReplaced(compaction.conversation.clone());
+
+                                yield AgentEvent::Message(
+                                    Message::assistant().with_system_notification(
+                                        SystemNotificationType::InlineMessage,
+                                        "Compaction complete",
+                                    )
+                                );
+                            }
+                            Err(e) => {
+                                yield AgentEvent::Message(
+                                    Message::assistant().with_text(
+                                        format!("Ran into this error trying to compact: {e}.\n\nPlease try again or create a new session")
+                                    )
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }.instrument(reply_stream_span));
         Ok(inner)

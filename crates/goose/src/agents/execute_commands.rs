@@ -178,11 +178,11 @@ impl Agent {
     }
 
     async fn handle_compact_command(&self, session_id: &str) -> Result<Option<Message>> {
-        let provider = self.provider().await?;
-        if provider.manages_own_context() {
+        let session_provider = self.provider().await?;
+        if session_provider.manages_own_context() {
             return Err(anyhow!(context_management_unsupported_message(
                 "compact",
-                provider.get_name()
+                session_provider.get_name()
             )));
         }
 
@@ -192,7 +192,8 @@ impl Agent {
             .conversation
             .ok_or_else(|| anyhow!("Session has no conversation"))?;
 
-        let model_config = self.model_config_for_session(session_id).await?;
+        let provider = self.compaction_provider(session_id).await?;
+        let model_config = self.compaction_model_config(session_id).await?;
         let compaction = compact_messages(
             provider.as_ref(),
             &model_config,
